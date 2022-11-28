@@ -13,6 +13,7 @@ from datasets import load_metric
 from tqdm.auto import tqdm
 import os
 import random
+import pickle
 
 
 def load_dataset(filename):
@@ -39,8 +40,9 @@ class BERT():
             model_name, num_labels=1)
 
         self.tokenizer = BertTokenizer.from_pretrained(model_name)
-        self.dropout = nn.Dropout(0.5)
-        self.linear = nn.Linear(768, 1)
+        # self.dropout = nn.Dropout(0.5)
+        # self.linear = nn.Linear(768, 1)
+        self.loss_fct = nn.CrossEntropyLoss()
 
     def get_tokenizer_and_model(self):
         return self.model, self.tokenizer
@@ -49,16 +51,20 @@ class BERT():
     #     return self.tokenizer.tokenize(data)
 
     def forward(self, input_ids, attn_mask, labels=None):
-        outputs = self.model(input_ids, attention_mask=attn_mask)
-        sequence_outputs = self.dropout(outputs[0])
-        logits = self.linear(sequence_outputs[:, 0, :].view(-1, 768)).logits
-        loss = None
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, 1), labels)
+        outputs = self.model(
+            input_ids, attention_mask=attn_mask, labels=labels)
+        return outputs
 
-            return TokenClassifierOutput(loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
-         # extract the 1st token's embeddings
+        # sequence_outputs = self.dropout(outputs[1])
+        # logits = torch.sigmoid(self.linear(sequence_outputs[:, 0, :].view(-1, 768)))
+        # logits = outputs.logits
+        # loss = None
+
+        # if labels is not None:
+        #     # loss = self.loss_fct(logits.view(-1, 1), labels)
+
+        #     return TokenClassifierOutput(loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
+        # extract the 1st token's embeddings
 
 
 if __name__ == "__main__":
@@ -68,7 +74,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     headline_pairs_pos = load_dataset('dataset/pos_headline_pairs.tsv')
-    headline_pairs_neg = load_dataset('dataset/neg_headline_pairs.tsv')
+    headline_pairs_neg = load_dataset('dataset/neg_headline_pairs_pp0.2.tsv')
     train_size = int(0.8 * len(headline_pairs_pos))
     test_size = len(headline_pairs_pos) - train_size
 
@@ -95,49 +101,69 @@ if __name__ == "__main__":
     # encoding_test = bert.tokenize_data(test_dataset)
     # encoding_validation = bert.tokenize_data(validation_dataset)
 
-    epochs = 5
+    epochs = 3
+    batch_size = 16
     progress_bar_train = tqdm(range(epochs * len(train_dataset)))
     progress_bar_test = tqdm(range(epochs * len(test_dataset)))
 
-    eval_metric = load_metric("accuracy")
+    # softmax_fct = nn.Softmax()
+    sigmoid_fct = nn.Sigmoid()
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-5)
 
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()))
-
+    print("\n Initiating Model Training..", end='\n\n')
     model.train()
-    # pprint.pprint(next(iter(train_dataloader)))
-    for epoch in range(epochs):
-        for batch in train_dataset:  # If you have a DataLoader()  object to get the data.
 
-            # data = [batch[0], batch[1]]
-            # print(data)
-            # print()
-            # assuming that data loader returns a tuple of data and its targets
-            targets = torch.from_numpy(np.array(np.float32(batch[2])))
-            # print(targets)
-            # print()
+    for epoch in range(epochs):
+        for batch_idx in range(0, len(train_dataset), batch_size):
+
             optimizer.zero_grad()
 
-            #encoding = bert.tokenizer.batch_encode_plus(data, return_tensors='pt', padding=True, truncation=True,max_length=50, add_special_tokens = True)
-            encoding = bert.tokenizer(batch[0], batch[1], return_tensors='pt', padding="max_length",
-                                      truncation=True, max_length=50, add_special_tokens=True)
+            batch = train_dataset[batch_idx:batch_idx+batch_size]
+
+            seq_pairs, targets = [], []
+            for pair in batch:
+                targets.append(np.float32(pair[2]))
+                seq_pairs.append((pair[0], pair[1]))
+
+            targets = torch.from_numpy(np.array(targets))
+
+            # encoding = bert.tokenizer(pair[0], pair[1], return_tensors='pt', padding="max_length", truncation=True, max_length=100, add_special_tokens=True)
+            encoding = bert.tokenizer.batch_encode_plus(
+                seq_pairs, return_tensors='pt', padding=True, truncation=True, max_length=100, add_special_tokens=True)
 
             input_ids = encoding['input_ids']
             attention_mask = encoding['attention_mask']
+
+            # outputs = torch.nn.functional.log_softmax(outputs, dim=1)
             outputs = model(
                 input_ids, attention_mask=attention_mask, labels=targets)
-            # outputs = torch.nn.functional.log_softmax(outputs, dim=1)
+
+            # print(sigmoid_fct(outputs.logits), targets, outputs.loss)
 
             loss = outputs.loss
             loss.backward()
             optimizer.step()
-            progress_bar_train.update(1)
+            progress_bar_train.update(batch_size)
 
-        model.eval()
+    predictions = []
+    labels = []
 
-        for batch in test_dataset:
-            encoding = bert.tokenizer(batch[0], batch[1], return_tensors='pt', padding="max_length",
-                                      truncation=True, max_length=50, add_special_tokens=True)
+    eval_metric_accuracy = load_metric("accuracy")
+    eval_metric_f1 = load_metric("f1")
+    eval_metric_recall = load_metric("recall")
+    eval_metric_precision = load_metric("precision")
+
+    print("\n Initiating Model Evaluation..", end='\n\n')
+    model.eval()
+
+    with open('experiments/results/test_headline_predictions.tsv', 'w') as pred_file:
+        
+        # creating csv writer objects for dataset samples
+        pred_file_writer = csv.writer(pred_file, delimiter="\t")
+        for pair in test_dataset:
+            encoding = bert.tokenizer(pair[0], pair[1], return_tensors='pt', padding="max_length",
+                                    truncation=True, max_length=100, add_special_tokens=True)
+
             input_ids = encoding['input_ids']
             attention_mask = encoding['attention_mask']
 
@@ -145,9 +171,30 @@ if __name__ == "__main__":
                 outputs = model(
                     input_ids, attention_mask=attention_mask, labels=targets)
 
-            logits = outputs.logits
-            predictions = torch.argmax(logits, dim=-1)
-            eval_metric.add(predictions=predictions, references=batch[2])
-            progress_bar_test.update(1)
+            predict_score = sigmoid_fct(outputs.logits)
+            out_label = '0' if predict_score < 0.5 else '1'
 
-        print(eval_metric.compute())
+            predictions.append((predict_score, out_label))
+            labels.append(pair[2])
+            print(predict_score.item(), out_label, pair[2])
+            pred_file_writer.writerow([pair, predict_score.item(), out_label, pair[2]])
+
+            eval_metric_accuracy.add(predictions=out_label, references=pair[2])
+            eval_metric_f1.add(predictions=out_label, references=pair[2])
+            eval_metric_recall.add(
+                predictions=out_label, references=pair[2])
+            eval_metric_precision.add(
+                predictions=out_label, references=pair[2])
+        # progress_bar_test.update(1)
+
+    print()
+    print(eval_metric_accuracy.compute())
+    print(eval_metric_precision.compute(average=None, zero_division=0))
+    print(eval_metric_recall.compute(average=None, zero_division=0))
+    print(eval_metric_f1.compute(average=None))
+
+    with open('dataset/predictions2.pkl', 'wb') as f:
+        pickle.dump(predictions, f)
+
+    with open('dataset/labels2.pkl', 'wb') as f:
+        pickle.dump(labels, f)
